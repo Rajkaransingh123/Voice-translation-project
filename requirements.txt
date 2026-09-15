@@ -1,0 +1,6 @@
+flask
+werkzeug
+openai-whisper
+deep-translator
+edge-tts
+fastapi
