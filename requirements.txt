@@ -1,6 +1,7 @@
-flask
-werkzeug
+fastapi
+uvicorn
+jinja2
+python-multipart
 openai-whisper
 deep-translator
 edge-tts
-fastapi

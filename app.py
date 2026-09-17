@@ -1,23 +1,24 @@
-from flask import Flask, request, render_template, jsonify, send_file
 import os
+import re
 import subprocess
 import threading
-from werkzeug.utils import secure_filename
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
 
-app = Flask(__name__)
+app = FastAPI(title="Video Translator App")
 
-# Use absolute paths based on where app.py lives
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, 'uploads')
-app.config['OUTPUT_FOLDER'] = os.path.join(BASE_DIR, 'outputs')
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB
-app.config['ALLOWED_EXTENSIONS'] = {'mp4', 'avi', 'mov', 'mkv'}
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+OUTPUT_FOLDER = os.path.join(BASE_DIR, 'outputs')
+MAX_CONTENT_LENGTH = 500 * 1024 * 1024  # 500MB
+ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv'}
 
-# Create directories if they don't exist
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, 'templates'))
 
-# Global processing status
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
 processing_status = {
     "state": "idle",
     "progress": 0,
@@ -27,7 +28,6 @@ processing_status = {
     "target_language": ""
 }
 
-# Language mapping for display names
 LANGUAGE_NAMES = {
     'hi': 'Hindi',
     'mr': 'Marathi',
@@ -37,44 +37,53 @@ LANGUAGE_NAMES = {
     'te': 'Telugu'
 }
 
+
+def secure_filename(filename):
+    filename = filename.replace('\\', '/')
+    filename = filename.split('/')[-1]
+    filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', filename)
+    return filename or 'file'
+
+
 def allowed_file(filename):
     return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-@app.route('/')
-def index():
-    return render_template('index.html')
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
+@app.get('/')
+def index(request: Request):
+    return templates.TemplateResponse(request=request, name="index.html")
+
+
+@app.post('/upload')
+async def upload_file(file: UploadFile = File(...), target_language: str = Form('hi')):
     global processing_status
-    
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-        
-    file = request.files['file']
-    
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-        
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail='No selected file')
+
     if not allowed_file(file.filename):
-        return jsonify({'error': 'Invalid file type'}), 400
+        raise HTTPException(status_code=400, detail='Invalid file type')
 
     if processing_status['state'] == 'processing':
-        return jsonify({'error': 'System busy processing another file'}), 429
+        raise HTTPException(status_code=429, detail='System busy processing another file')
 
-    target_language = request.form.get('target_language', 'hi')
-    
     if target_language not in ['hi', 'mr', 'ta', 'gu', 'bn', 'te']:
-        return jsonify({'error': 'Invalid target language'}), 400
+        raise HTTPException(status_code=400, detail='Invalid target language')
 
     try:
         filename = secure_filename(file.filename)
-        upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(upload_path)
-        
+        upload_path = os.path.join(UPLOAD_FOLDER, filename)
+
+        contents = await file.read()
+        if len(contents) > MAX_CONTENT_LENGTH:
+            raise HTTPException(status_code=413, detail='File too large (max 500MB)')
+
+        with open(upload_path, 'wb') as f:
+            f.write(contents)
+
         language_name = LANGUAGE_NAMES.get(target_language, target_language)
-        
+
         processing_status.update({
             "state": "processing",
             "progress": 0,
@@ -83,66 +92,66 @@ def upload_file():
             "output_file": "",
             "target_language": target_language
         })
-        
+
         processing_thread = threading.Thread(
             target=process_video,
             args=(upload_path, filename, target_language)
         )
         processing_thread.start()
-        
-        return jsonify({
+
+        return JSONResponse({
             'message': f'File {filename} uploaded successfully for {language_name} translation',
             'filename': filename,
             'target_language': target_language
         })
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 def process_video(filepath, original_filename, target_language):
     global processing_status
-    base_name = os.path.splitext(os.path.basename(filepath))[0]  # FIX: use basename of full path
+    base_name = os.path.splitext(os.path.basename(filepath))[0]
     language_name = LANGUAGE_NAMES.get(target_language, target_language)
-    
+
     try:
         processing_status['message'] = f"Starting video processing for {language_name} translation"
-        
-        # Run main.py with absolute path to the file
+
         main_py = os.path.join(BASE_DIR, 'main.py')
         result = subprocess.run(
             ['python', main_py, filepath, target_language],
             capture_output=True,
             text=True,
-            cwd=BASE_DIR  # FIX: always run from project folder
+            cwd=BASE_DIR
         )
-        
+
         if result.returncode != 0:
             raise Exception(f"Processing failed: {result.stderr}")
-        
-        # FIX: look for output file in BASE_DIR where main.py saves it
+
         expected_output = os.path.join(BASE_DIR, f"{base_name}_output_video.mp4")
         if not os.path.exists(expected_output):
             raise Exception(f"Output file not generated. main.py output was: {result.stdout}")
-            
-        # Move to outputs directory
+
         output_filename = f"{base_name}_{language_name}.mp4"
-        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+        output_path = os.path.join(OUTPUT_FOLDER, output_filename)
         os.rename(expected_output, output_path)
-        
+
         processing_status.update({
             "state": "completed",
             "progress": 100,
             "message": f"Processing completed successfully. {language_name} translation ready!",
             "output_file": output_filename
         })
-        
+
     except Exception as e:
         processing_status.update({
             "state": "error",
             "message": f"Error: {str(e)}",
             "output_file": ""
         })
-        
+
     finally:
         if os.path.exists(filepath):
             try:
@@ -150,20 +159,23 @@ def process_video(filepath, original_filename, target_language):
             except:
                 pass
 
-@app.route('/status')
+
+@app.get('/status')
 def get_status():
-    return jsonify(processing_status)
+    return JSONResponse(processing_status)
 
-@app.route('/download/<filename>')
-def download_file(filename):
-    safe_filename = secure_filename(filename)
-    file_path = os.path.join(app.config['OUTPUT_FOLDER'], safe_filename)
-    
+
+@app.get('/download/{filename}')
+def download_file(filename: str):
+    safe_filename = os.path.basename(filename)
+    file_path = os.path.join(OUTPUT_FOLDER, safe_filename)
+
     if os.path.exists(file_path):
-        return send_file(file_path, as_attachment=True)
-    return jsonify({'error': 'File not found'}), 404
+        return FileResponse(file_path, filename=safe_filename)
+    return JSONResponse({'error': 'File not found'}, status_code=404)
 
-@app.route('/reset', methods=['POST'])
+
+@app.post('/reset')
 def reset_system():
     global processing_status
     processing_status = {
@@ -174,7 +186,9 @@ def reset_system():
         "output_file": "",
         "target_language": ""
     }
-    return jsonify({'message': 'System reset successfully'})
+    return JSONResponse({'message': 'System reset successfully'})
+
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    import uvicorn
+    uvicorn.run(app, host='0.0.0.0', port=5000)

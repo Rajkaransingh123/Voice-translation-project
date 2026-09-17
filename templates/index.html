@@ -468,7 +468,7 @@
             .then(response => {
                 if (!response.ok) {
                     return response.json().then(data => {
-                        throw new Error(data.error || 'Upload failed');
+                        throw new Error(data.detail || data.error || 'Upload failed');
                     });
                 }
                 return response.json();
